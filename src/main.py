@@ -11,6 +11,8 @@ import ros_numpy
 from sensor_msgs.msg import PointCloud2, PointField, Image
 from std_msgs.msg import Header
 from transforms import Transforms
+from CMU_Mask_R_CNN.msg import predictions
+from message_filters import ApproximateTimeSynchronizer
 
 
 def point_cloud(points, parent_frame):
@@ -61,76 +63,80 @@ class Camera_Projection_Node:
         rospy.loginfo('Received transforms from camera_info topic. Continuing...')
 
         self.sub_velodyne = rospy.Subscriber(
-            '/velodyne_points', PointCloud2, self.velodyne_callback)
-        self.sub_cam = rospy.Subscriber(
-            '/mapping/left/image_raw', Image, self.image_callback)
+            '/velodyne_points', PointCloud2)
+        self.sub_predictions = rospy.Subscriber(
+            '/cnn_predictions', predictions)
+        ts = ApproximateTimeSynchronizer(
+            [self.sub_velodyne, self.sub_predictions], queue_size=10, slop=0.3)
+        ts.registerCallback(self.projection_callback)
+
         self.pub_viz = rospy.Publisher(
             '/projection_viz', Image, queue_size=1)
         self.pub_cloud = rospy.Publisher(
             '/transformed', PointCloud2, queue_size=1)
 
-    def image_callback(self, data):
-        self.last_image = data
-
-    def velodyne_callback(self, data):
+    def projection_callback(self, data_velo, data_predictions):
         image = cv2.cvtColor(self.cv_bridge.imgmsg_to_cv2(
-            self.last_image, desired_encoding='bgr8'), cv2.COLOR_BGR2RGB)
+            data_predictions.source_image, desired_encoding='bgr8'), cv2.COLOR_BGR2RGB)
         img_height, img_width, _ = image.shape
 
-        lidar_ = ros_numpy.numpify(data)
+        lidar_ = ros_numpy.numpify(data_velo)
         lidar = np.zeros((lidar_.shape[0], 3))
         lidar[:, 0] = lidar_['x']
         lidar[:, 1] = lidar_['y']
         lidar[:, 2] = lidar_['z']
         # intensities = lidar_['intensity']
 
-        self.render_lidar_on_image(lidar, image, img_width, img_height)
-
-    def render_lidar_on_image(self, pts_velo, img, img_width, img_height):
         # Final projection from lidar to camera
         proj_lidar_to_cam = self.transforms.intrinsic \
                           @ self.transforms.rect \
                           @ self.transforms.lidar_to_cam
 
         # Pad with reflectances
-        pts_velo = np.concatenate(
-            (pts_velo, np.ones((pts_velo.shape[0], 1))), axis=1)
+        lidar = np.concatenate(
+            (lidar, np.ones((lidar.shape[0], 1))), axis=1)
 
         # Transpose for easier matrix multiplication
-        pts_velo = pts_velo.transpose()
+        lidar = lidar.transpose()
 
         # If you wish to publish the transformed pointcloud for testing
-        pts_3d = self.transforms.lidar_to_cam @ pts_velo
+        pts_3d = self.transforms.lidar_to_cam @ lidar
         pts_3d = pts_3d.transpose().astype('float32')
         pts_3d[:, 3] = pts_3d[:, 2]
         self.pub_cloud.publish(point_cloud(pts_3d, 'map'))
 
         # Perform the actual transformation to camera frame
-        transformed = proj_lidar_to_cam @ pts_velo
+        transformed = proj_lidar_to_cam @ lidar
         transformed[:2, :] /= transformed[2, :]
 
         # Find indices where the transformed points are within the camera FOV
         inds = np.where((transformed[0, :] < img_width) & (transformed[0, :] >= 0) &
                         (transformed[1, :] < img_height) & (transformed[1, :] >= 0) &
-                        (pts_velo[0, :] > 0)
+                        (lidar[0, :] > 0)
                         )[0]
 
         # Get image pixels where there are lidar points
         imgfov_lidar_pixels = transformed[:, inds]
 
+        # Visualization: plot lidar points on the image colored by depth
+        self.render_on_image(imgfov_lidar_pixels, image)
+
         # Get the original lidar points that correspond with the pixel points
         # (usesful for other operations, but will be unused for visualization)
         # lidar_points_in_imgfov = pts_velo.transpose()[inds, :]
 
+        # TODO: Implement determining depths of the masks and publishing
+
+    def render_on_image(self, lidar_pixels, img):
         cmap = plt.cm.get_cmap('hsv', 256)
         cmap = np.array([cmap(i) for i in range(256)])[:, :3] * 255
-        max_depth = np.amax(imgfov_lidar_pixels[2, :])
+        max_depth = np.amax(lidar_pixels[2, :])
 
-        for i in range(imgfov_lidar_pixels.shape[1]):
-            depth = imgfov_lidar_pixels[2, i]
+        for i in range(lidar_pixels.shape[1]):
+            depth = lidar_pixels[2, i]
             color = cmap[int(depth * 255.0 / max_depth), :]
-            cv2.circle(img, (int(np.round(imgfov_lidar_pixels[0, i])),
-                             int(np.round(imgfov_lidar_pixels[1, i]))),
+            cv2.circle(img, (int(np.round(lidar_pixels[0, i])),
+                             int(np.round(lidar_pixels[1, i]))),
                        2, color=tuple(color), thickness=-1)
 
         ros_msg = self.cv_bridge.cv2_to_imgmsg(img, encoding="bgr8")
