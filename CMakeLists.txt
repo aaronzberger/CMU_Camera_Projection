@@ -8,6 +8,8 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   message_generation
   vision_msgs
+  sensor_msgs
+  CMU_Mask_R_CNN
 )
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
@@ -26,6 +28,8 @@ add_message_files(
 generate_messages(
   DEPENDENCIES
   vision_msgs
+  sensor_msgs
+  CMU_Mask_R_CNN
 )
 
 ###################################
@@ -35,7 +39,7 @@ generate_messages(
 catkin_package(
 #  INCLUDE_DIRS include
 #  LIBRARIES CMU_Mask_R_CNN
-  CATKIN_DEPENDS message_runtime vision_msgs sensor_msgs
+  CATKIN_DEPENDS message_runtime vision_msgs sensor_msgs CMU_Mask_R_CNN
 #  DEPENDS system_lib
 )
 
