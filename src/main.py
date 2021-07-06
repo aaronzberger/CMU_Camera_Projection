@@ -2,7 +2,6 @@
 
 # -*- encoding: utf-8 -*-
 
-from numpy.lib.function_base import flip
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -13,12 +12,13 @@ import ros_numpy
 from sensor_msgs.msg import PointCloud2, PointField, Image
 from geometry_msgs.msg import Pose, Point, Vector3
 from std_msgs.msg import Header
+from nav_msgs.msg import Odometry
 from transforms import Transforms
-from CMU_Mask_R_CNN import msg
 from CMU_Camera_Projection.msg import predictions
 from vision_msgs.msg import BoundingBox3D
-from message_filters import ApproximateTimeSynchronizer
+from message_filters import ApproximateTimeSynchronizer, TimeSynchronizer
 from scipy.spatial.transform import Rotation as R
+from CMU_Mask_R_CNN import msg
 
 
 def point_cloud(points, parent_frame):
@@ -68,26 +68,48 @@ class Camera_Projection_Node:
         self.transforms.all_transforms_available.wait()
         rospy.loginfo('Received transforms from camera_info topic. Continuing...')
 
-        self.sub_velodyne = message_filters.Subscriber(
-            '/velodyne_points', PointCloud2)
-        self.sub_predictions = message_filters.Subscriber(
-            '/cnn_predictions', msg.predictions)
-        ts = ApproximateTimeSynchronizer(
-            [self.sub_velodyne, self.sub_predictions], queue_size=20, slop=0.2)
+        self.sub_registered = message_filters.Subscriber(
+            '/velodyne_cloud_registered', PointCloud2)
+        self.sub_cloud_transform = message_filters.Subscriber(
+            '/aft_mapped_to_init', Odometry)
+        ts = TimeSynchronizer(
+            [self.sub_registered, self.sub_cloud_transform], queue_size=10)
         ts.registerCallback(self.projection_callback)
+        self.sub_image = rospy.Subscriber(
+            '/mapping/left/image_raw', Image, self.image_callback)
 
         self.pub_viz = rospy.Publisher(
             '/projection_viz', Image, queue_size=1)
         self.pub_predictions = rospy.Publisher(
             '/projected_predictions', predictions, queue_size=1)
         self.pub_test = rospy.Publisher(
-            'vis_full', Image, queue_size=1)
+            '/vis_full', Image, queue_size=1)
         self.pub_cloud = rospy.Publisher(
             '/transformed', PointCloud2, queue_size=1)
+        self.pub_odom = rospy.Publisher(
+            'received_odom', Odometry, queue_size=1)
 
-    def projection_callback(self, data_velo, data_predictions):
+        self.image_queue = []
+
+    def image_callback(self, data):
+        if len(self.image_queue) >= 10:
+            self.image_queue.pop(0)
+        self.image_queue.append(data)
+
+    def projection_callback(self, data_velo, data_transform):
+        print('aggregated', data_velo.header.stamp.secs, data_velo.header.stamp.nsecs)
+        print('transform', data_transform.header.stamp.secs, data_transform.header.stamp.nsecs)
+
+        if len(self.image_queue) == 0:
+            return
+        time_offsets = [abs(msg.header.stamp.to_sec() - data_velo.header.stamp.to_sec()) for msg in self.image_queue]
+        closest_msg_idx = np.argmin(time_offsets)
+        data_predictions = self.image_queue[closest_msg_idx]
+
+        print('image', data_predictions.header.stamp.secs, data_predictions.header.stamp.nsecs)
+
         image = cv2.cvtColor(self.cv_bridge.imgmsg_to_cv2(
-            data_predictions.source_image, desired_encoding='bgr8'), cv2.COLOR_BGR2RGB)
+            data_predictions, desired_encoding='bgr8'), cv2.COLOR_BGR2RGB)
         img_height, img_width, _ = image.shape
 
         lidar_ = ros_numpy.numpify(data_velo)
@@ -97,10 +119,20 @@ class Camera_Projection_Node:
         lidar[:, 2] = lidar_['z']
         # intensities = lidar_['intensity']
 
+        quat = data_transform.pose.pose.orientation
+        registered_rotation = R.from_quat([quat.x, quat.y, quat.z, quat.w])
+        registered_rotation = registered_rotation.inv()
+        registered_transform = np.eye(4)
+        registered_transform[:3, :3] = registered_rotation.as_matrix()
+        pos = data_transform.pose.pose.position
+        registered_transform[:3, 3] = [pos.x, pos.y, -pos.z]
+
         # Final projection from lidar to camera
         proj_lidar_to_cam = self.transforms.intrinsic \
                           @ self.transforms.rect \
                           @ self.transforms.lidar_to_cam
+
+        proj_registered_to_cam = proj_lidar_to_cam @ registered_transform
 
         # Pad with reflectances
         lidar = np.concatenate(
@@ -110,13 +142,13 @@ class Camera_Projection_Node:
         lidar = lidar.transpose()
 
         # If you wish to publish the transformed pointcloud for testing
-        pts_3d = self.transforms.lidar_to_cam @ lidar
+        pts_3d = registered_transform @ self.transforms.lidar_to_cam @ lidar
         pts_3d = pts_3d.transpose().astype('float32')
         pts_3d[:, 3] = pts_3d[:, 2]
         self.pub_cloud.publish(point_cloud(pts_3d, 'map'))
 
         # Perform the actual transformation to camera frame
-        transformed = proj_lidar_to_cam @ lidar
+        transformed = proj_registered_to_cam @ lidar
         transformed[:2, :] /= transformed[2, :]
 
         # Find indices where the transformed points are within the camera FOV
@@ -136,10 +168,17 @@ class Camera_Projection_Node:
             imgfov_lidar_pixels[0, i] = max(0, imgfov_lidar_pixels[0, i])
 
         # Visualization: plot lidar points on the image colored by depth
+        # print(imgfov_lidar_pixels.shape)
+        if imgfov_lidar_pixels.shape[1] == 0:
+            return
 
         img = self.render_on_image(imgfov_lidar_pixels, image)
         ros_msg = self.cv_bridge.cv2_to_imgmsg(img, encoding="bgr8")
         self.pub_viz.publish(ros_msg)
+
+        self.pub_odom.publish(data_transform)
+
+        return
 
         # Get the original lidar points that correspond with the pixel points
         # (usesful for other operations, but will be unused for visualization)
