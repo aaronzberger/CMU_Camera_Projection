@@ -18,10 +18,10 @@ from CMU_Camera_Projection.msg import predictions
 from vision_msgs.msg import BoundingBox3D
 from message_filters import ApproximateTimeSynchronizer
 import utm
-from bisect import bisect
 from sensor_msgs.msg import NavSatFix, Imu
 import math
 from scipy.spatial.transform import Rotation as R
+from interpolate_topic import Interpolation_Subscriber
 
 
 def point_cloud(points, parent_frame):
@@ -79,10 +79,14 @@ class Camera_Projection_Node:
         self.imu_time_queue = []
         self.IMU_QUEUE_SIZE = 20
 
-        self.sub_gps = rospy.Subscriber(
-            '/dji_sdk/gps_position', NavSatFix, self.gps_callback)
-        self.sub_imu = rospy.Subscriber(
-            '/dji_sdk/imu', Imu, self.imu_callback)
+        self.interpolate_gps = Interpolation_Subscriber(
+            '/dji_sdk/gps_position', NavSatFix,
+            get_fn=lambda data: [data.latitude, data.longitude])
+        self.interpolate_imu = Interpolation_Subscriber(
+            '/dji_sdk/imu', Imu,
+            get_fn=lambda data: R.from_quat([getattr(
+                data.orientation, i) for i in 'xyzw']).as_euler('xyz')[2])
+
         self.sub_velodyne = message_filters.Subscriber(
             '/velodyne_points', PointCloud2)
         self.sub_predictions = message_filters.Subscriber(
@@ -97,51 +101,6 @@ class Camera_Projection_Node:
             '/projected_predictions', predictions, queue_size=1)
         self.pub_object_depths = rospy.Publisher(
             '/vis_full', Image, queue_size=1)
-
-    def imu_callback(self, data):
-        if len(self.imu_msg_queue) < self.IMU_QUEUE_SIZE:
-            self.imu_msg_queue.append(data.orientation)
-            self.imu_time_queue.append(data.header.stamp.to_sec())
-        else:
-            self.imu_msg_queue.append(data.orientation)
-            self.imu_time_queue.append(data.header.stamp.to_sec())
-            self.imu_msg_queue.pop(0)
-            self.imu_time_queue.pop(0)
-
-    def gps_callback(self, data):
-        if len(self.gps_msg_queue) < self.GPS_QUEUE_SIZE:
-            self.gps_msg_queue.append([data.latitude, data.longitude])
-            self.gps_time_queue.append(data.header.stamp.to_sec())
-        else:
-            self.gps_msg_queue.append([data.latitude, data.longitude])
-            self.gps_time_queue.append(data.header.stamp.to_sec())
-            self.gps_msg_queue.pop(0)
-            self.gps_time_queue.pop(0)
-
-    def interp_gps_position(self, stamp):
-        stamp = stamp.to_sec()
-
-        # Find the two messages this is in between ->
-        # where this time stamp should be inserted to keep the array sorted
-        idx = bisect(self.gps_time_queue, stamp)
-
-        if idx == 0:
-            return self.gps_msg_queue[0]
-        elif idx == len(self.gps_msg_queue):
-            return self.gps_msg_queue[-1]
-
-        # Get the positions and times for the message directly before and after
-        before, after = self.gps_msg_queue[idx - 1:idx + 1]
-        t_before, t_after = self.gps_time_queue[idx - 1:idx + 1]
-
-        # Calculate the fraction of time we are between the two messages
-        time_thru = (stamp - t_before) / (t_after - t_before)
-
-        # Interpolate the positions
-        lat = before[0] + (time_thru * (after[0] - before[0]))
-        lon = before[1] + (time_thru * (after[1] - before[1]))
-
-        return [lat, lon]
 
     def projection_callback(self, data_velo, data_predictions):
         image = cv2.cvtColor(self.cv_bridge.imgmsg_to_cv2(
@@ -228,34 +187,22 @@ class Camera_Projection_Node:
             else:
                 objects_in_lidar.append([np.median(mask_x), np.mean(mask_y), np.mean(mask_z)])
 
-        gps_position = self.interp_gps_position(data_velo.header.stamp)
+        gps_position = self.interpolate_gps.get(data_velo.header.stamp)
         utm_pos = utm.from_latlon(*gps_position)
+
+        yaw_offset = self.interpolate_imu.get(data_velo.header.stamp) - (math.pi / 2)
+
         for box, object in zip(data_predictions.bboxes, objects_in_lidar):
             if object is not None:
                 print(box.center.x, box.center.y, object[:3])
-                idx = (np.abs(np.array(self.imu_time_queue) - data_velo.header.stamp.to_sec())).argmin()
-                rpy = R.from_quat([self.imu_msg_queue[idx].x, self.imu_msg_queue[idx].y, self.imu_msg_queue[idx].z, self.imu_msg_queue[idx].w]).as_euler('xyz', degrees=False)
-                # new_x = object[0] * math.cos(-rpy[2]) + object[1] * math.sin(-rpy[2])
-                # new_y = -object[0] * math.sin(-rpy[2]) + object[1] * math.cos(-rpy[2])
+                new_x = object[0] * math.cos(-yaw_offset) + object[1] * math.sin(-yaw_offset)
+                new_y = -object[0] * math.sin(-yaw_offset) + object[1] * math.cos(-yaw_offset)
 
                 # print(new_x, new_y)
-                utm_x = utm_pos[0] + object[0]
-                utm_y = utm_pos[1] + object[1]
+                utm_x = utm_pos[0] + new_x
+                utm_y = utm_pos[1] + new_y
                 new_gps = utm.to_latlon(utm_x, utm_y, zone_number=utm_pos[2], zone_letter=utm_pos[3])
                 print(gps_position, new_gps)
-
-
-        # all_lidar_positions = []
-        # cam_to_lidar = np.eye(4)
-        # cam_to_lidar[:3, :] = proj_lidar_to_cam
-        # cam_to_lidar[3] = [0, 0, 0, 1]
-        # cam_to_lidar = np.linalg.inv(cam_to_lidar)
-
-        # for box, depth in zip(data_predictions.bboxes, objects_in_lidar):
-        #     print(box.center.x, box.center.y)
-        #     in_lidar = cam_to_lidar @ [box.center.x, box.center.y, depth, 0]
-        #     print(in_lidar)
-        #     all_lidar_positions.append([*in_lidar, depth])
 
         # Publish the predictions message
         pub_msg = predictions(header=Header(stamp=data_predictions.header.stamp))
