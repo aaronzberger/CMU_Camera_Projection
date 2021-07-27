@@ -9,55 +9,18 @@ import matplotlib.pyplot as plt
 import message_filters
 import rospy
 import ros_numpy
-from sensor_msgs.msg import PointCloud2, PointField, Image
-from geometry_msgs.msg import Pose, Point, Vector3
+from sensor_msgs.msg import PointCloud2, Image
 from std_msgs.msg import Header
 from transforms import Transforms
 from CMU_Mask_R_CNN import msg
 from CMU_Camera_Projection.msg import predictions
-from vision_msgs.msg import BoundingBox3D
 from message_filters import ApproximateTimeSynchronizer
 import utm
 from sensor_msgs.msg import NavSatFix, Imu
 import math
 from scipy.spatial.transform import Rotation as R
 from interpolate_topic import Interpolation_Subscriber
-
-
-def point_cloud(points, parent_frame):
-    '''
-    Create a PointCloud2 message.
-
-    Parameters:
-        points: Nx4 array of xyz positions (m) and reflectances (0-1)
-        parent_frame: frame in which the point cloud is defined
-
-    Returns:
-        sensor_msgs/PointCloud2 message
-    '''
-    ros_dtype = PointField.FLOAT32
-    dtype = np.float32
-    itemsize = np.dtype(dtype).itemsize
-
-    data = points.astype(dtype).tobytes()
-
-    fields = [PointField(
-        name=n, offset=i*itemsize, datatype=ros_dtype, count=1)
-        for i, n in enumerate(['x', 'y', 'z', 'intensity'])]
-
-    header = Header(frame_id=parent_frame, stamp=rospy.Time.now())
-
-    return PointCloud2(
-        header=header,
-        height=1,
-        width=points.shape[0],
-        is_dense=False,
-        is_bigendian=False,
-        fields=fields,
-        point_step=(itemsize * 4),
-        row_step=(itemsize * 4 * points.shape[0]),
-        data=data
-    )
+# from CMU_Camera_Projection.msg import trunk
 
 
 class Camera_Projection_Node:
@@ -71,21 +34,14 @@ class Camera_Projection_Node:
         self.transforms.all_transforms_available.wait()
         rospy.loginfo('Received transforms from camera_info topic. Continuing...')
 
-        self.gps_msg_queue = []
-        self.gps_time_queue = []
-        self.GPS_QUEUE_SIZE = 20
-
-        self.imu_msg_queue = []
-        self.imu_time_queue = []
-        self.IMU_QUEUE_SIZE = 20
-
         self.interpolate_gps = Interpolation_Subscriber(
             '/dji_sdk/gps_position', NavSatFix,
             get_fn=lambda data: [data.latitude, data.longitude])
         self.interpolate_imu = Interpolation_Subscriber(
             '/dji_sdk/imu', Imu,
             get_fn=lambda data: R.from_quat([getattr(
-                data.orientation, i) for i in 'xyzw']).as_euler('xyz')[2])
+                data.orientation, i) for i in 'xyzw']).as_euler('xyz')[2],
+            queue_size=250)
 
         self.sub_velodyne = message_filters.Subscriber(
             '/velodyne_points', PointCloud2)
@@ -142,9 +98,9 @@ class Camera_Projection_Node:
 
         # Temporary, to fix the extrinsic calibration
         # TODO: Re-calibrate extrinsic transformation and use transforms.py
-        imgfov_lidar_pixels[0, :] -= 25
-        for i in range(len(imgfov_lidar_pixels[0, :])):
-            imgfov_lidar_pixels[0, i] = max(0, imgfov_lidar_pixels[0, i])
+        # imgfov_lidar_pixels[0, :] -= 25
+        # for i in range(len(imgfov_lidar_pixels[0, :])):
+        #     imgfov_lidar_pixels[0, i] = max(0, imgfov_lidar_pixels[0, i])
 
         # Visualization: plot lidar points on the image colored by depth
         cmap = plt.cm.get_cmap('hsv', 256)
@@ -187,31 +143,30 @@ class Camera_Projection_Node:
             else:
                 objects_in_lidar.append([np.median(mask_x), np.mean(mask_y), np.mean(mask_z)])
 
-        gps_position = self.interpolate_gps.get(data_velo.header.stamp)
-        utm_pos = utm.from_latlon(*gps_position)
+        drone_gps_pos = self.interpolate_gps.get(data_velo.header.stamp)
+        drone_utm_pos = utm.from_latlon(*drone_gps_pos)
 
-        yaw_offset = self.interpolate_imu.get(data_velo.header.stamp) - (math.pi / 2)
+        # IMU points north, so rotate 90deg to east, since lat/lon points east
+        drone_yaw = self.interpolate_imu.get(data_velo.header.stamp) - (math.pi / 2)
 
-        for box, object in zip(data_predictions.bboxes, objects_in_lidar):
+        trunks = []
+
+        for object in objects_in_lidar:
             if object is not None:
-                print(box.center.x, box.center.y, object[:3])
-                new_x = object[0] * math.cos(-yaw_offset) + object[1] * math.sin(-yaw_offset)
-                new_y = -object[0] * math.sin(-yaw_offset) + object[1] * math.cos(-yaw_offset)
+                obj_gps_offset_x = object[0] * math.cos(-drone_yaw) + object[1] * math.sin(-drone_yaw)
+                obj_gps_offset_y = -object[0] * math.sin(-drone_yaw) + object[1] * math.cos(-drone_yaw)
 
-                # print(new_x, new_y)
-                utm_x = utm_pos[0] + new_x
-                utm_y = utm_pos[1] + new_y
-                new_gps = utm.to_latlon(utm_x, utm_y, zone_number=utm_pos[2], zone_letter=utm_pos[3])
-                print(gps_position, new_gps)
+                obj_utm_x = drone_utm_pos[0] + obj_gps_offset_x
+                obj_utm_y = drone_utm_pos[1] + obj_gps_offset_y
+                object_gps = utm.to_latlon(obj_utm_x, obj_utm_y, zone_number=drone_utm_pos[2], zone_letter=drone_utm_pos[3])
 
-        # Publish the predictions message
+                # TODO: add trunk widths to published message
+                # trunks.append(trunk(lat=object_gps[0], lon=object_gps[1]))
+
+                print(drone_gps_pos, object_gps)
+
         pub_msg = predictions(header=Header(stamp=data_predictions.header.stamp))
-        for box, depth in zip(data_predictions.bboxes, objects_in_lidar):
-            box_3d = BoundingBox3D()
-            box_3d.center = Pose(position=Point(x=depth, y=box.center.x, z=box.center.y))
-            box_3d.size = Vector3(x=box.size_x, y=box.size_x, z=box.size_y)
-            pub_msg.bboxes.append(box_3d)
-
+        # pub_msg.trunks = trunks
         self.pub_predictions.publish(pub_msg)
 
         # Visualization: plot lidar points on image colored by depth and draw

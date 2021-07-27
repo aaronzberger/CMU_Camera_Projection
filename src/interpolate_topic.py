@@ -18,6 +18,13 @@ class Interpolation_Subscriber:
         self.time_queue = []
         self.queue_size = queue_size
         self.get_fn = get_fn
+        self.topic_name = topic_name
+
+        self.bounds_queue_size = 10
+        self.bounds_queue_thresh = 0.5
+        self.bounds_queue = [False] * self.bounds_queue_size
+        self.warning_on = False
+        self.counter = 0
 
     def callback(self, msg):
         data = self.get_fn(msg)
@@ -38,16 +45,31 @@ class Interpolation_Subscriber:
         Returns:
             any: interpolated value(s)
         '''
+        # Check for a high ratio of beginning selections
+        pos = len(list(filter(lambda x: x is True, self.bounds_queue)))
+        self.warning_on = pos / self.bounds_queue_size >= self.bounds_queue_thresh
+
+        self.counter += 1
+        if self.warning_on and self.counter % 5 == 0:
+            print('\033[01;31m' + 'Warning: For topic {}, Interpolator\'s queue size is likely too small: {} of the last {} stamps were out of bounds'.format(
+                self.topic_name, pos, self.bounds_queue_size) + '\033[02;0m')
+
         stamp = stamp.to_sec()
 
         # Find the two messages this is in between ->
         # where this time stamp should be inserted to keep the array sorted
+        # print(self.topic_type, self.time_queue, stamp)
         idx = bisect(self.time_queue, stamp)
 
+        self.bounds_queue.pop(0)
+
         if idx == 0:
+            self.bounds_queue.append(True)
             return self.msg_queue[0]
         elif idx == len(self.msg_queue):
             return self.msg_queue[-1]
+
+        self.bounds_queue.append(False)
 
         # Get the positions and times for the message directly before and after
         before, after = self.msg_queue[idx - 1:idx + 1]
@@ -57,6 +79,9 @@ class Interpolation_Subscriber:
         time_thru = (stamp - t_before) / (t_after - t_before)
 
         # Interpolate the positions
+        if type(before) != list:
+            before = [before]
+            after = [after]
         between = [before[i] + (time_thru * (after[i] - before[i]))
                    for i in range(len(before))]
 
